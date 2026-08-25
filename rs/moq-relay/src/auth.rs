@@ -25,6 +25,10 @@ use url::Url;
 pub struct AuthParams {
 	/// The URL path identifying the broadcast root.
 	pub path: String,
+	/// The URL host, forwarded to the auth API in [`AuthApiMode::Proxy`] so the
+	/// endpoint can do its own subdomain routing. `None` outside a URL-dialed
+	/// connection (the gateways pass a path directly).
+	pub host: Option<String>,
 	/// A JWT token, if provided via the `jwt` query parameter.
 	pub jwt: Option<String>,
 	/// The connection's transport, forwarded to the auth API as `transport=` so it
@@ -59,6 +63,7 @@ impl AuthParams {
 			Some(slug) => format!("/{slug}{}", url.path()),
 			None => url.path().to_string(),
 		};
+		let host = url.host_str().map(str::to_ascii_lowercase);
 
 		let mut jwt = None;
 
@@ -73,6 +78,7 @@ impl AuthParams {
 
 		Self {
 			path,
+			host,
 			jwt,
 			..Default::default()
 		}
@@ -158,6 +164,9 @@ pub enum AuthError {
 	#[error("key not found")]
 	KeyNotFound,
 
+	#[error("the auth API refused the credential")]
+	Refused,
+
 	#[error("the auth API has no grant for this connection")]
 	NotFound,
 
@@ -197,6 +206,7 @@ impl AuthError {
 				| Self::IncorrectRoot
 				| Self::KeyNotFound
 				| Self::MissingKeyId
+				| Self::Refused
 				| Self::NotFound
 				| Self::InvalidKeyId(_)
 		)
@@ -449,6 +459,23 @@ pub struct AuthConfig {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub auth_api: Option<String>,
 
+	/// How `--auth-api` decides a connection: `token` (default) or `proxy`.
+	///
+	/// `token` keeps the relay as the verifier: the endpoint returns a `key` for
+	/// the JWT's `kid`, or `public` prefixes for a tokenless connection.
+	///
+	/// `proxy` makes the endpoint the decider: the relay forwards the connection
+	/// verbatim - host, path, mTLS flag, transport, and the credential as
+	/// `Authorization: Bearer` - and enforces the `grant` it gets back, verifying
+	/// nothing and holding no keys. The credential is part of the request, so
+	/// responses cache per credential and auth cost tracks concurrent viewers
+	/// rather than broadcasts.
+	///
+	/// `Option` so a TOML value survives the CLI re-parse.
+	#[arg(long = "auth-api-mode", env = "MOQ_AUTH_API_MODE", value_enum)]
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub api_mode: Option<AuthApiMode>,
+
 	/// Billing tier label for mTLS peers when the auth API doesn't return one
 	/// (or no `--auth-api` is configured). Defaults to the unprefixed tier.
 	#[arg(long = "auth-mtls-tier", env = "MOQ_AUTH_MTLS_TIER")]
@@ -578,6 +605,51 @@ struct PublicResponse {
 	publish: Vec<String>,
 }
 
+/// How `--auth-api` decides a connection.
+///
+/// These are separate MODES rather than two shapes of one response, deliberately.
+/// Letting a single endpoint answer either way per connection means both paths
+/// live inside one request: which cache key to use, whether the credential may be
+/// sent, what "still vouched for" means. Choosing once, per relay, keeps each
+/// path independently simple.
+///
+/// `#[non_exhaustive]` so a third strategy is not a breaking release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[non_exhaustive]
+pub enum AuthApiMode {
+	/// The endpoint returns a verifying `key` for the JWT's `kid`, or the `public`
+	/// prefixes for a tokenless connection, and the relay checks the credential
+	/// itself.
+	///
+	/// The request depends only on (`kid`, root, transport), so a whole audience
+	/// sharing a signing key resolves to ONE cached request per relay. Auth cost
+	/// tracks broadcasts and keys, not viewers.
+	#[default]
+	Token,
+
+	/// The relay forwards the connection verbatim - host, path, transport, and
+	/// the credential - and enforces the `grant` it gets back. It verifies
+	/// nothing itself and holds no keys. mTLS peers are unaffected either way:
+	/// they resolve through [`Auth::verify_mtls`], which never consults a mode.
+	///
+	/// The credential is part of the request, so responses cache per credential
+	/// and auth cost tracks concurrent viewers rather than broadcasts. In exchange
+	/// the endpoint owns every policy decision - key rotation, scoping, expiry,
+	/// per-viewer rules - and changing one is a deploy of the endpoint rather than
+	/// a roll of the fleet.
+	Proxy,
+}
+
+/// Parses the same spellings the CLI and TOML accept, case-insensitively.
+impl std::str::FromStr for AuthApiMode {
+	type Err = String;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		<Self as clap::ValueEnum>::from_str(s, true)
+	}
+}
+
 /// The configured `--auth-api`, and the revalidation state that belongs to it.
 ///
 /// One struct rather than two `Option`s that were always in lockstep:
@@ -588,6 +660,10 @@ struct PublicResponse {
 #[derive(Clone)]
 struct AuthApi {
 	base: url::Url,
+	/// How this endpoint decides a connection. Part of the endpoint rather than
+	/// of [`Auth`], so a live session's re-check asks the question its admission
+	/// asked - see [`Revalidate::api`].
+	mode: AuthApiMode,
 	client: ClientWithMiddleware,
 	revalidator: Arc<Revalidator>,
 }
@@ -616,7 +692,11 @@ impl AuthApi {
 	/// so there is no safe fallback. Also returns the response's `Cache-Control`
 	/// timings, which drive revalidation.
 	async fn fetch(&self, request: &AuthApiRequest) -> Result<(AuthApiResponse, CacheHints), AuthError> {
-		let response = self.client.get(request.url(&self.base)).send().await?;
+		let mut get = self.client.get(request.url(&self.base));
+		if let Some(credential) = &request.credential {
+			get = get.header(http::header::AUTHORIZATION, format!("Bearer {credential}"));
+		}
+		let response = get.send().await?;
 
 		// `Warning: 111` means the cache served a STALE entry because it could not
 		// reach the origin (RFC 2616 14.46). Treating that as a success would let a
@@ -645,8 +725,14 @@ impl AuthApi {
 struct AuthApiRequest {
 	/// The connection path.
 	path: String,
-	/// The JWT `kid` to resolve a verifying key for.
+	/// The connection's URL host. Sent in [`AuthApiMode::Proxy`] only, where the
+	/// endpoint does its own subdomain routing.
+	host: Option<String>,
+	/// The JWT `kid` to resolve a verifying key for ([`AuthApiMode::Token`]).
 	kid: Option<String>,
+	/// The credential, forwarded as `Authorization: Bearer`
+	/// ([`AuthApiMode::Proxy`]).
+	credential: Option<String>,
 	/// Set only after the relay has verified the peer's client certificate.
 	mtls: bool,
 	transport: Option<&'static str>,
@@ -655,12 +741,17 @@ struct AuthApiRequest {
 impl AuthApiRequest {
 	/// The request URL. Everything the endpoint keys on is a query param on the
 	/// base URL - never a path segment - so client-controlled values are
-	/// percent-encoded by `query_pairs_mut` and can't retarget the path/query.
+	/// percent-encoded by `query_pairs_mut` and can't retarget the path/query. The
+	/// credential is never a query param: it is a bearer secret and would land in
+	/// access logs.
 	fn url(&self, base: &url::Url) -> url::Url {
 		let mut url = base.clone();
 		{
 			let mut q = url.query_pairs_mut();
 			q.append_pair("root", self.path.trim_matches('/'));
+			if let Some(host) = &self.host {
+				q.append_pair("host", host);
+			}
 			if let Some(kid) = &self.kid {
 				q.append_pair("kid", kid);
 			}
@@ -676,13 +767,14 @@ impl AuthApiRequest {
 
 	/// What two sessions must share before they can share one re-check.
 	///
-	/// Derived from the request that actually gets sent, never rebuilt alongside
-	/// it: a key assembled from parts can describe a different request than the
-	/// one issued, which silently costs a re-check per viewer instead of per
-	/// broadcast.
+	/// Its URL plus the credential that does not appear in the URL, derived from
+	/// the request that actually gets sent rather than rebuilt alongside it: a key
+	/// assembled from parts can describe a different request than the one issued,
+	/// which silently costs a re-check per viewer instead of per broadcast.
 	fn identity(&self, base: &url::Url) -> FlightKey {
 		FlightKey {
 			url: self.url(base).into(),
+			credential: self.credential.clone(),
 		}
 	}
 }
@@ -701,6 +793,11 @@ struct AuthApiResponse {
 	/// moq-token's serde); absent -> not found.
 	#[serde(default)]
 	key: Option<Key>,
+	/// A grant the endpoint resolved from the credential itself, for a credential
+	/// the relay cannot verify locally. Takes precedence over `key`. See
+	/// [`GrantResponse`].
+	#[serde(default)]
+	grant: Option<GrantResponse>,
 	/// Billing tier label for this connection (e.g. `region/sjc`).
 	/// The relay sends `mtls=true` when the peer presented a verified client
 	/// cert and lets the API decide. Absent or empty selects the default
@@ -714,6 +811,66 @@ impl AuthApiResponse {
 	/// relay's per-connection default.
 	fn tier(&self) -> Option<Tier> {
 		self.tier.clone().map(Tier::new)
+	}
+}
+
+/// A grant the auth API resolved itself, instead of handing back a key for the
+/// relay to verify a JWT against.
+///
+/// This is what lets a credential the relay cannot parse authorize a connection:
+/// the relay forwards it as `Authorization: Bearer` and the endpoint answers with
+/// the permissions directly. One endpoint and one response type covers both, so
+/// it can answer with a `key` for one connection and a `grant` for another; there
+/// is no second flag and an operator migrates per connection.
+#[derive(Debug, Default, Deserialize)]
+struct GrantResponse {
+	/// Root the permissions below are relative to; absent -> the connection path.
+	#[serde(default)]
+	root: Option<String>,
+	#[serde(default)]
+	subscribe: Vec<String>,
+	#[serde(default)]
+	publish: Vec<String>,
+	/// Unix seconds after which the session closes. There is no JWT to read an
+	/// `exp` from, so this is the outer bound; an endpoint that omits it is asking
+	/// for a session that ends only when revalidation says so.
+	#[serde(default)]
+	exp: Option<u64>,
+}
+
+impl GrantResponse {
+	/// Claims equivalent to what a JWT carrying this grant would have decoded to.
+	///
+	/// An `exp` already in the past is refused rather than admitted, matching what
+	/// `Key::verify` does with an expired JWT. Admitting it would hand back a
+	/// session that closes on its next tick, which looks like a flap rather than a
+	/// refusal.
+	fn to_claims(&self, path: &str) -> Result<moq_token::Claims, AuthError> {
+		// `SystemTime + Duration` PANICS on overflow, so an endpoint answering with
+		// a huge `exp` would take down the connection task rather than be refused.
+		let expires = match self.exp {
+			Some(exp) => Some(
+				std::time::UNIX_EPOCH
+					.checked_add(Duration::from_secs(exp))
+					.ok_or(AuthError::Refused)?,
+			),
+			None => None,
+		};
+		if expires.is_some_and(|expires| expires <= std::time::SystemTime::now()) {
+			return Err(AuthError::Refused);
+		}
+		let mut claims = moq_token::Claims::default()
+			.with_root(self.root.clone().unwrap_or_else(|| path.to_string()))
+			.with_subscribe(self.subscribe.clone())
+			.with_publish(self.publish.clone());
+		claims.expires = expires;
+		Ok(claims)
+	}
+
+	/// True when the endpoint returned a grant that authorizes nothing, which is
+	/// a refusal rather than an empty success.
+	fn is_empty(&self) -> bool {
+		self.subscribe.is_empty() && self.publish.is_empty()
 	}
 }
 
@@ -961,13 +1118,14 @@ struct FlightSlot {
 /// One auth-API re-check request; sessions that would issue the identical
 /// request share a flight. Built by [`AuthApiRequest::identity`].
 ///
-/// The credential is not part of it: the response depends only on (`kid`, root,
-/// transport), so an audience sharing one `kid` shares one re-check however many
-/// distinct tokens they hold, and auth cost tracks broadcasts rather than
-/// viewers.
+/// In [`AuthApiMode::Token`] the credential is absent, so an audience sharing one
+/// `kid` shares one re-check however many distinct tokens they hold. In
+/// [`AuthApiMode::Proxy`] the credential is the authorization, so nothing merges
+/// across viewers - that is the cost of the mode, not a defect in the key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FlightKey {
 	url: String,
+	credential: Option<String>,
 }
 
 /// Shared state for live-session revalidation.
@@ -1228,6 +1386,7 @@ impl Auth {
 		let auth_api = match config.auth_api {
 			Some(url_str) => Some(AuthApi {
 				base: Url::parse(&url_str).context("invalid --auth-api URL")?,
+				mode: config.api_mode.unwrap_or_default(),
 				client: Self::build_client(&tls)?,
 				revalidator: Arc::default(),
 			}),
@@ -1292,7 +1451,9 @@ impl Auth {
 
 		let request = AuthApiRequest {
 			path: path.to_string(),
+			host: None,
 			kid: None,
+			credential: None,
 			mtls: true,
 			transport: transport.map(Transport::as_str),
 		};
@@ -1306,71 +1467,102 @@ impl Auth {
 	/// alias (root), the billing tier, and EITHER something to verify the
 	/// credential against (a `key`) or the answer itself (a `grant`).
 	async fn verify_via_api(&self, api: &AuthApi, params: &AuthParams) -> Result<(AuthToken, CacheHints), AuthError> {
-		let request = self.api_request(params)?;
+		let request = Self::api_request(api, params)?;
 		let (resp, hints) = api.fetch(&request).await?;
-		Ok((self.authorize(params, &resp)?, hints))
+		Ok((Self::authorize(api, params, &resp)?, hints))
 	}
 
 	/// Turn one auth-API reply into this connection's token.
 	///
 	/// Split out from the fetch because the two have different scopes: the reply
-	/// depends only on (`kid`, root, transport) and is shared, while the
-	/// authorization depends on the credential and is emphatically NOT. See
-	/// [`Fetched`].
-	fn authorize(&self, params: &AuthParams, resp: &AuthApiResponse) -> Result<AuthToken, AuthError> {
-		let claims = match params.jwt.as_deref() {
-			Some(token) => {
-				let key = resp.key.as_ref().ok_or(AuthError::KeyNotFound)?;
-				// claims.root is the token's own root (a vanity name OR a pid); it is
-				// checked against the ORIGINAL connection path below, not the alias, so
-				// a vanity token matches a vanity URL and a pid token matches a pid URL.
-				key.verify(token).map_err(|_| AuthError::DecodeFailed)?
-			}
-			None => {
-				let public = resp.public.as_ref();
-				let subscribe = public.map(|p| p.subscribe.clone()).unwrap_or_default();
-				let publish = public.map(|p| p.publish.clone()).unwrap_or_default();
-				if subscribe.is_empty() && publish.is_empty() {
-					return Err(AuthError::ExpectedToken);
+	/// depends only on the request and is shared, while the authorization depends
+	/// on the credential and is emphatically NOT. See [`Fetched`].
+	fn authorize(api: &AuthApi, params: &AuthParams, resp: &AuthApiResponse) -> Result<AuthToken, AuthError> {
+		let claims = match api.mode {
+			// The endpoint hands back something to check the credential AGAINST,
+			// and the relay does the checking.
+			AuthApiMode::Token => match params.jwt.as_deref() {
+				Some(token) => {
+					let key = resp.key.as_ref().ok_or(AuthError::KeyNotFound)?;
+					// claims.root is the token's own root (a vanity name OR a pid); it
+					// is checked against the ORIGINAL connection path below, not the
+					// alias, so a vanity token matches a vanity URL and a pid token
+					// matches a pid URL.
+					key.verify(token).map_err(|_| AuthError::DecodeFailed)?
 				}
-				// Anonymous access: anchor the public claims at the connection path so
-				// the overlap check below is a no-op; routing lands on the alias.
-				moq_token::Claims::default()
-					.with_root(params.path.clone())
-					.with_subscribe(subscribe)
-					.with_publish(publish)
+				None => {
+					let public = resp.public.as_ref();
+					let subscribe = public.map(|p| p.subscribe.clone()).unwrap_or_default();
+					let publish = public.map(|p| p.publish.clone()).unwrap_or_default();
+					if subscribe.is_empty() && publish.is_empty() {
+						return Err(AuthError::ExpectedToken);
+					}
+					// Anonymous access: anchor the public claims at the connection path
+					// so the overlap check below is a no-op; routing lands on the alias.
+					moq_token::Claims::default()
+						.with_root(params.path.clone())
+						.with_subscribe(subscribe)
+						.with_publish(publish)
+				}
+			},
+			// The endpoint already decided. A reply with no usable grant is a
+			// refusal; there is no second shape to fall back to.
+			AuthApiMode::Proxy => {
+				let grant = resp.grant.as_ref().ok_or(AuthError::Refused)?;
+				if grant.is_empty() {
+					return Err(AuthError::Refused);
+				}
+				grant.to_claims(&params.path)?
 			}
 		};
 
 		Self::finalize_api(params, resp.alias.clone(), resp.tier(), claims)
 	}
 
-	/// The auth-API request for a connection.
+	/// The auth-API request for a connection, decided once by the mode.
 	///
 	/// Admission and every re-check build the request here, so the flight key can
-	/// be taken from the request itself rather than reconstructed beside it. The
-	/// credential is never sent: the response depends only on (kid, root,
-	/// transport), which is what lets a whole audience sharing a signing key
-	/// resolve to one cached request per relay.
-	fn api_request(&self, params: &AuthParams) -> Result<AuthApiRequest, AuthError> {
-		Ok(AuthApiRequest {
-			path: params.path.clone(),
-			kid: match params.jwt.as_deref() {
-				Some(token) => {
-					jsonwebtoken::decode_header(token)
-						.map_err(|_| AuthError::DecodeFailed)?
-						.kid
-				}
-				None => None,
+	/// be taken from the request itself rather than reconstructed beside it.
+	fn api_request(api: &AuthApi, params: &AuthParams) -> Result<AuthApiRequest, AuthError> {
+		let transport = params.transport.map(Transport::as_str);
+		Ok(match api.mode {
+			// The credential is NEVER sent: the response depends only on (kid, root,
+			// transport), which is what lets a whole audience sharing a signing key
+			// resolve to one cached request per relay.
+			AuthApiMode::Token => AuthApiRequest {
+				path: params.path.clone(),
+				host: None,
+				kid: match params.jwt.as_deref() {
+					Some(token) => {
+						jsonwebtoken::decode_header(token)
+							.map_err(|_| AuthError::DecodeFailed)?
+							.kid
+					}
+					None => None,
+				},
+				credential: None,
+				mtls: false,
+				transport,
 			},
-			mtls: false,
-			transport: params.transport.map(Transport::as_str),
+			// The connection goes over verbatim and the relay verifies nothing.
+			AuthApiMode::Proxy => AuthApiRequest {
+				path: params.path.clone(),
+				host: params.host.clone(),
+				kid: None,
+				credential: params.jwt.clone(),
+				mtls: false,
+				transport,
+			},
 		})
 	}
 
 	/// The flight key for a live session's re-check.
-	fn flight_key(&self, grant: &Revalidate) -> Option<FlightKey> {
-		Some(self.api_request(&grant.params).ok()?.identity(&grant.api.base))
+	fn flight_key(grant: &Revalidate) -> Option<FlightKey> {
+		Some(
+			Self::api_request(&grant.api, &grant.params)
+				.ok()?
+				.identity(&grant.api.base),
+		)
 	}
 
 	/// Anchor verified claims on the API's alias, shared by both modes.
@@ -1624,7 +1816,7 @@ impl Auth {
 	async fn recheck(&self, grant: &Revalidate) -> Recheck {
 		match self.fetch_shared(grant).await {
 			// The reply is shared; the verdict is this session's alone.
-			Fetched::Ok { resp, hints } => match self.authorize(&grant.params, &resp) {
+			Fetched::Ok { resp, hints } => match Self::authorize(&grant.api, &grant.params, &resp) {
 				Ok(token) if grant.scope.covered_by(&token) => Recheck::Valid { hints },
 				Ok(_) => Recheck::Revoked,
 				Err(err) if err.is_refusal() => Recheck::Revoked,
@@ -1637,7 +1829,7 @@ impl Auth {
 
 	/// The shared auth-API fetch, joining an in-flight one for the same request.
 	async fn fetch_shared(&self, grant: &Revalidate) -> Fetched {
-		let Some(key) = self.flight_key(grant) else {
+		let Some(key) = Self::flight_key(grant) else {
 			return Fetched::Unavailable;
 		};
 		let revalidator = &grant.api.revalidator;
@@ -1676,7 +1868,7 @@ impl Auth {
 	/// check ("does a key still exist for this kid?") cannot see a key REPLACED
 	/// under that kid, and cannot see an anonymous grant withdrawn.
 	async fn recheck_fetch(&self, grant: &Revalidate) -> Fetched {
-		let request = match self.api_request(&grant.params) {
+		let request = match Self::api_request(&grant.api, &grant.params) {
 			Ok(request) => request,
 			// The credential parsed at admission, so this cannot be transient.
 			Err(_) => return Fetched::Refused,
@@ -2914,7 +3106,7 @@ api = "https://api.example.com/access"
 	// HTTP-based tests (URL key-dir + public API) using wiremock.
 	// ---------------------------------------------------------------------
 
-	use wiremock::matchers::{method, path as path_matcher, query_param};
+	use wiremock::matchers::{header, method, path as path_matcher, query_param};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	/// Serialize a key as JSON for serving from a mock URL endpoint.
@@ -3582,6 +3774,17 @@ api = "https://api.example.com/access"
 	async fn auth_with_api(server: &MockServer) -> Auth {
 		Auth::new(AuthConfig {
 			auth_api: Some(format!("{}/auth", server.uri())),
+			..Default::default()
+		})
+		.await
+		.unwrap()
+	}
+
+	/// The same endpoint, with the relay forwarding instead of verifying.
+	async fn auth_with_api_proxy(server: &MockServer) -> Auth {
+		Auth::new(AuthConfig {
+			auth_api: Some(format!("{}/auth", server.uri())),
+			api_mode: Some(AuthApiMode::Proxy),
 			..Default::default()
 		})
 		.await
@@ -4712,6 +4915,29 @@ api = "https://api.example.com/access"
 		Ok(())
 	}
 
+	/// In proxy mode the credential IS the authorization, so two viewers holding
+	/// different ones must not share a flight even on the same path. This is the
+	/// cost of the mode, and the reason token mode does not send the credential.
+	#[tokio::test]
+	async fn revalidate_does_not_coalesce_across_credentials_in_proxy_mode() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.respond_with(ResponseTemplate::new(404).set_delay(Duration::from_millis(300)))
+			.expect(2)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let a = test_grant(&auth, Some("credential-a".into()), Duration::from_millis(100));
+		let b = test_grant(&auth, Some("credential-b".into()), Duration::from_millis(100));
+
+		let (a, b) = tokio::join!(auth.revalidate(&a), auth.revalidate(&b));
+		assert_eq!(a, Expired::Revoked);
+		assert_eq!(b, Expired::Revoked);
+		Ok(())
+	}
+
 	#[tokio::test]
 	async fn revalidate_drops_an_abandoned_flight() -> anyhow::Result<()> {
 		let server = MockServer::start().await;
@@ -4802,6 +5028,317 @@ api = "https://api.example.com/access"
 			.await
 			.expect("a withdrawn grant must close even without a local endpoint");
 		assert_eq!(reason, Expired::Revoked);
+		Ok(())
+	}
+
+	// --- Proxy mode: the endpoint decides, the relay enforces ---
+
+	/// The relay forwards the connection verbatim and enforces what comes back.
+	/// The credential need not be a JWT at all - in token mode this one is
+	/// rejected before any request is made.
+	#[tokio::test]
+	async fn proxy_forwards_the_connection_and_enforces_the_grant() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("root", "demo"))
+			.and(query_param("host", "live.example.com"))
+			.and(header("Authorization", "Bearer opaque-session-cookie"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_string(r#"{"alias":"x7k2qp","grant":{"subscribe":["room"],"publish":["room/alice"]}}"#),
+			)
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let token = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				host: Some("live.example.com".into()),
+				jwt: Some("opaque-session-cookie".into()),
+				..Default::default()
+			})
+			.await?;
+
+		assert_eq!(token.root.as_str(), "x7k2qp");
+		assert_eq!(
+			token.subscribe.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+			["room"]
+		);
+		assert_eq!(
+			token.publish.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+			["room/alice"]
+		);
+		Ok(())
+	}
+
+	/// There is no JWT to read an `exp` from, so the grant's own `exp` is the
+	/// outer bound.
+	#[tokio::test]
+	async fn proxy_grant_exp_bounds_the_session() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(
+			&server,
+			"max-age=60",
+			r#"{"grant":{"subscribe":[""],"exp":1893456000}}"#.to_string(),
+		)
+		.await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let token = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some("opaque".into()),
+				..Default::default()
+			})
+			.await?;
+		assert_eq!(
+			token.expires,
+			Some(std::time::UNIX_EPOCH + Duration::from_secs(1893456000))
+		);
+		Ok(())
+	}
+
+	/// An `exp` that would overflow `SystemTime` is refused, not panicked on.
+	#[tokio::test]
+	async fn proxy_absurd_grant_exp_is_refused() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(
+			&server,
+			"max-age=60",
+			format!(r#"{{"grant":{{"subscribe":[""],"exp":{}}}}}"#, u64::MAX),
+		)
+		.await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let result = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some("opaque".into()),
+				..Default::default()
+			})
+			.await;
+		assert!(matches!(result, Err(AuthError::Refused)), "got {result:?}");
+		Ok(())
+	}
+
+	/// An `exp` already in the past is refused, not admitted into a session that
+	/// closes on its next tick.
+	#[tokio::test]
+	async fn proxy_expired_grant_is_refused() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(
+			&server,
+			"max-age=60",
+			r#"{"grant":{"subscribe":[""],"exp":1}}"#.to_string(),
+		)
+		.await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let result = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some("opaque".into()),
+				..Default::default()
+			})
+			.await;
+		assert!(matches!(result, Err(AuthError::Refused)), "got {result:?}");
+		Ok(())
+	}
+
+	/// A reply with no usable grant is a refusal. There is no second shape to fall
+	/// back to, so an empty grant, a missing one, and a `key` are all the same
+	/// answer: proxy mode holds no keys and verifies nothing.
+	#[tokio::test]
+	async fn proxy_requires_a_non_empty_grant() -> anyhow::Result<()> {
+		let key = create_test_key_with_kid("test-key");
+		for body in [
+			r#"{"grant":{}}"#.to_string(),
+			r#"{"alias":"x7k2qp"}"#.to_string(),
+			format!(r#"{{"key":{}}}"#, jwk_body(&key)),
+			r#"{"public":{"subscribe":[""]}}"#.to_string(),
+		] {
+			let server = MockServer::start().await;
+			mount_auth(&server, "max-age=60", body.clone()).await;
+			let auth = auth_with_api_proxy(&server).await;
+			let result = auth
+				.verify(&AuthParams {
+					path: "demo".into(),
+					jwt: Some("opaque".into()),
+					..Default::default()
+				})
+				.await;
+			assert!(matches!(result, Err(AuthError::Refused)), "{body} gave {result:?}");
+		}
+		Ok(())
+	}
+
+	/// Anonymous connections go through the same call - the endpoint knows there
+	/// was no credential and answers accordingly.
+	#[tokio::test]
+	async fn proxy_authorizes_an_anonymous_connection() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(&server, "max-age=60", r#"{"grant":{"subscribe":[""]}}"#.to_string()).await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let token = auth.verify(&AuthParams::new("demo")).await?;
+		assert!(token.revalidate.is_some(), "anonymous proxy sessions revalidate too");
+
+		let sent = server.received_requests().await.expect("recorded requests");
+		assert!(
+			sent[0].headers.get("Authorization").is_none(),
+			"there is no credential to forward"
+		);
+		Ok(())
+	}
+
+	// --- The modes are independent ---
+
+	/// Token mode NEVER sends the credential: the response depends only on (kid,
+	/// root, transport), which is what lets an audience share one cached request.
+	#[tokio::test]
+	async fn token_mode_never_sends_the_credential() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		let key = create_test_key_with_kid("test-key");
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("kid", "test-key"))
+			.respond_with(ResponseTemplate::new(200).set_body_string(format!(r#"{{"key":{}}}"#, jwk_body(&key))))
+			.mount(&server)
+			.await;
+
+		let auth = auth_with_api(&server).await;
+		let jwt = key.sign(&moq_token::Claims::default().with_root("demo").with_subscribe([""]))?;
+		auth.verify(&AuthParams {
+			path: "demo".into(),
+			host: Some("live.example.com".into()),
+			jwt: Some(jwt),
+			..Default::default()
+		})
+		.await?;
+
+		let sent = server.received_requests().await.expect("recorded requests");
+		assert_eq!(sent.len(), 1);
+		assert!(
+			sent[0].headers.get("Authorization").is_none(),
+			"a kid lookup must not carry the credential"
+		);
+		assert!(
+			!sent[0].url.query_pairs().any(|(k, _)| k == "host"),
+			"the relay does its own subdomain routing in token mode"
+		);
+		Ok(())
+	}
+
+	/// A `grant` is inert in token mode. Honoring one would authorize a signature
+	/// the relay never checked - and that reply is cached per `kid` and shared
+	/// across the audience, so a forged token with a known kid would inherit it.
+	#[tokio::test]
+	async fn token_mode_ignores_a_grant() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(query_param("kid", "test-key"))
+			.respond_with(ResponseTemplate::new(200).set_body_string(r#"{"grant":{"subscribe":[""]}}"#))
+			.mount(&server)
+			.await;
+
+		// A token nobody signed, carrying a known kid: header {"alg":"HS256",
+		// "kid":"test-key"} and claims {"root":"demo","sub":[""]}.
+		let forged = concat!(
+			"eyJhbGciOiJIUzI1NiIsImtpZCI6InRlc3Qta2V5In0.",
+			"eyJyb290IjoiZGVtbyIsInN1YiI6WyIiXX0.",
+			"bm90LWEtc2lnbmF0dXJl"
+		);
+
+		let auth = auth_with_api(&server).await;
+		let result = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some(forged.into()),
+				..Default::default()
+			})
+			.await;
+		assert!(
+			matches!(result, Err(AuthError::KeyNotFound)),
+			"a kid lookup must require a key, got {result:?}"
+		);
+		Ok(())
+	}
+
+	/// A proxy session revalidates like any other, against the same grant reply.
+	#[tokio::test]
+	async fn proxy_session_survives_revalidation() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(&server, "max-age=1", r#"{"grant":{"subscribe":[""]}}"#.to_string()).await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let token = auth
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some("opaque".into()),
+				..Default::default()
+			})
+			.await?;
+		let grant = token.revalidate.clone().expect("proxy sessions revalidate");
+
+		let pending = tokio::time::timeout(Duration::from_millis(2500), auth.revalidate(&grant)).await;
+		assert!(pending.is_err(), "a still-granted proxy session must keep serving");
+		Ok(())
+	}
+
+	/// Withdrawing the grant closes a proxy session, the same way a withdrawn key
+	/// or `public` block closes a token-mode one.
+	#[tokio::test]
+	async fn proxy_session_closes_when_the_grant_is_withdrawn() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		mount_auth(&server, "max-age=1", r#"{"alias":"demo"}"#.to_string()).await;
+
+		let auth = auth_with_api_proxy(&server).await;
+		let grant = test_grant(&auth, Some("opaque".into()), Duration::from_millis(200));
+		let reason = tokio::time::timeout(Duration::from_secs(5), auth.revalidate(&grant))
+			.await
+			.expect("a withdrawn grant must close the session");
+		assert_eq!(reason, Expired::Revoked);
+		Ok(())
+	}
+
+	/// The MODE rides on the grant alongside the endpoint, for the same reason
+	/// #3069 moved the endpoint there: a re-check must ask the question admission
+	/// asked. Judged by a token-mode `Auth` instead, this session's re-check would
+	/// send no credential, find no `key`, and close a session the endpoint is
+	/// still granting.
+	#[tokio::test]
+	async fn revalidate_keeps_the_granting_mode() -> anyhow::Result<()> {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path_matcher("/auth"))
+			.and(header("Authorization", "Bearer opaque"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.insert_header("Cache-Control", "max-age=1")
+					.set_body_string(r#"{"grant":{"subscribe":[""]}}"#),
+			)
+			.mount(&server)
+			.await;
+
+		let issuer = auth_with_api_proxy(&server).await;
+		let token = issuer
+			.verify(&AuthParams {
+				path: "demo".into(),
+				jwt: Some("opaque".into()),
+				..Default::default()
+			})
+			.await?;
+		let grant = token.revalidate.clone().expect("proxy sessions revalidate");
+
+		// The mock only answers a request carrying the credential, so a token-mode
+		// re-check would 404 and revoke.
+		let token_mode = auth_with_api(&server).await;
+		let pending = tokio::time::timeout(Duration::from_millis(2500), token_mode.revalidate(&grant)).await;
+		assert!(pending.is_err(), "a proxy grant must be re-checked in proxy mode");
 		Ok(())
 	}
 
